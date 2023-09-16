@@ -30,7 +30,7 @@
 # ---------------------------------------------------------------------------- #
 CC		= cc -O3
 CFLAGS += -Wall
-NAME	= sclocka
+NAME	= tvi_screensaver
 LIBS	= -lutil
 OBJS	= $(NAME).o
 PREFIX ?= /usr/local
@@ -41,7 +41,7 @@ deinstall uninstall clean
 all:	with_pam
 
 with_pam:
-	$(CC) $(CFLAGS) -DWITH_PAM=1 -o $(NAME) $(NAME).c $(LIBS) -lpam
+	$(CC) $(CFLAGS) -DPIZZI -DWITH_PAM=1 -o $(NAME) $(NAME).c $(LIBS) -lpam
 
 FreeBSD:	without_pam
 NetBSD:		without_pam

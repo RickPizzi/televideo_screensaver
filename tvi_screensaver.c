@@ -1,8 +1,9 @@
 /* -------------------------------------------------------------------------- */
-/* Sclocka - Screen saver/lock for terminals                                  */
+/* tvi_screensaver -  screen saver with lock for Televideo terminals          */
 /* -------------------------------------------------------------------------- */
 
-/* Based on ASCII Saver - https://gitlab.com/mezantrop/ascsaver */
+/* Based on Sclocka - https://gitlab.com/mezantrop/sclocka */
+/* Adapted for Televideo terminals by Rick Pizzi pizzi@leopardus.com */
 
 /*
 * Copyright (c) 2019-2023, Mikhail Zakharov <zmey20000@yahoo.com>
@@ -60,17 +61,16 @@
 #endif
 
 /* -------------------------------------------------------------------------- */
-#define __PROGRAM       "Sclocka - screen saver/lock for terminals, v1.0.3"
+#define __PROGRAM       "tvi_screensaver - screen saver/lock for terminals"
 
 #define NBF_STDOUT()    setvbuf(stdout, NULL, _IONBF, 0)
 #define LBF_STDOUT()    setvbuf(stdout, NULL, _IOLBF, 0)
+#define HIDE_CURSOR() fputs("\033.", stdout)           /* Hide cursor */
+#define SHOW_CURSOR() fputs("\033.", stdout)           /* Show cursor */
 
-#define HIDE_CURSOR() fputs("\033[?25l", stdout)           /* Hide cursor */
-#define SHOW_CURSOR() fputs("\033[?25h", stdout)           /* Show cursor */
-#define CLL()         fputs("\033[1K", stdout)             /* Clear line to ^*/
-#define CLS()         fputs("\033[1H\033[J", stdout)       /* Clear screen */
+#define CLL()         fputs("\033T", stdout)             /* Clear line to ^*/
+#define CLS()         fputs("\033*", stdout)       	/* Clear screen */
 #define CLR()         fputs("\033[0m", stdout)             /* Reset graphic */
-#define SET_POS(y, x) fprintf(stdout, "\033[%d;%dH", y, x) /* Set cursor XY */
 #define ASCR()        fputs("\033[?1049h", stdout)         /* Alt scr buffer */
 #define NSCR()        fputs("\033[?1049l", stdout)         /* normal scr buffer */
 
@@ -80,15 +80,8 @@
     scanf("\033[%d;%dR", &y, &x);\
 }
 
-/* Get screen size */
-#define SCR_SIZE(y, x) {\
-    SET_POS(999, 999);\
-    GET_POS(y, x);\
-}
-
-#define PWD_PROMPT      "\r%s@%s password: "
+#define PWD_PROMPT      "\rpassword: "
 #define IVAL            5               /* Default start interval in secs */
-#define SPEED           64              /* Default show speed in milliseconds */
 #define BUFSZ           1024            /* Various buffers */
 
 #define RSCR_NONE       'n'
@@ -101,27 +94,24 @@
     #define PAM_SERV        "login"
 #endif
 
-/* -------------------------------------------------------------------------- */
 void quit(int ecode);
-void trap(int sig);
 void wait4child(pid_t pid);
-int run_show();
 #if (WITH_PAM)
     int read_password(char ch, int lock, char *user,
         char *host, char *pam_service);
     int pam_auth(char *user, char *service);
 #endif
 void usage(int ecode);
+void print_buffer(char scrbuf[]);
 
-/* -------------------------------------------------------------------------- */
 int master, slave;      /* PTY master/slave parts */
 struct termios tt;      /* Original terminal capabilities */
-int cx, cy, sy, sx;     /* Current and absolute positions */
 #if (WITH_PAM)
     char passwd[PAM_MAX_RESP_SIZE];
     int pwd_ofs = 0;
 #endif
 int lock = 2;           /* 0: password unlocked; 1: locked; 2: locked 1st run */
+int cursor_visible = 1;
 
 /* -------------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
@@ -132,19 +122,18 @@ int main(int argc, char *argv[]) {
     pid_t pid;
     char *sh = NULL;                    /* Shell to load */
     char buf[64 * BUFSZ] = {0};         /* Terminal IO buffer */
-    char scrbuf[BUFSZ * BUFSZ] = {0};   /* The screen buffer */
+    char scrbuf[2000] = {0};   /* The screen buffer */
     int scrbufp = 0;                    /* Offset in the screen buffer */
     time_t tvec, start;
     struct timeval tv;
-    int in_show = 0;                    /* A flag to activite the show */
+    int in_show = 0;                    /* terminal blanked when 1 */
+    int reblank = 0;
 
     int flg;                            /* Command-line options flag */
     int cflg = 1;                       /* Clear screen on the first run */
     int cls = 1;                        /* Perform screen cleaning or not */
     long ival = IVAL;                   /* Start interval in secs */
-    int speed = SPEED;                  /* Animation speed in milliseconds */
     char bflg = RSCR_BUFF;              /* Default restore screen method */
-    int Bflg = 0;                       /* Run screensaver animation */
 
     #if (WITH_PAM)
         char *user;                     /* username */
@@ -157,9 +146,9 @@ int main(int argc, char *argv[]) {
     unsigned char ff = 0x0C;            /* Form Feed */
 
     #if (WITH_PAM)
-        while ((flg = getopt(argc, argv, "b:cBi:pP:s:h")) != -1)
+        while ((flg = getopt(argc, argv, "b:ci:pP:h")) != -1)
     #else
-        while ((flg = getopt(argc, argv, "b:cBi:s:h")) != -1)
+        while ((flg = getopt(argc, argv, "b:ci:h")) != -1)
     #endif
         switch(flg) {
             case 'b':
@@ -173,9 +162,6 @@ int main(int argc, char *argv[]) {
                 break;
             case 'c':
                 cls = cflg = 0;     /* Do not clean the screen on the 1-st run */
-                break;
-            case 'B':
-                Bflg = 1;           /* No screensaver animation */
                 break;
             case 'i':
                 if ((ival = strtol(optarg, (char **)NULL, 10)) < 1) {
@@ -191,12 +177,6 @@ int main(int argc, char *argv[]) {
                 pam_service = optarg;
                 break;
         #endif
-            case 's':
-                if ((speed = strtol(optarg, (char **)NULL, 10)) < 1) {
-                    fprintf(stderr, "FATAL: wrong [-s speed] value");
-                    usage(1);
-                }
-                break;
             case 'h':
             default:
                 usage(0);
@@ -239,24 +219,23 @@ int main(int argc, char *argv[]) {
         if (!(sh = getenv("SHELL"))) sh = _PATH_BSHELL;
         close(master);
         login_tty(slave);
-        execl(sh, sh, "-i", (char *)NULL);
+        execl(sh, sh, "-l", (char *)NULL);
         exit(0);
     }
 
     /* -- Parent continues here --------------------------------------------- */
-    signal(SIGWINCH, trap);                 /* Catch window change signal */
     #if (WITH_PAM)
         user = getlogin();
         gethostname(host, sizeof(host));
     #endif
 
-    NBF_STDOUT(); GET_POS(cy, cx); SCR_SIZE(sy, sx); SET_POS(cy, cx);
+    NBF_STDOUT(); 
     start = time(0);                        /* Set initial time */
     srand(start);                           /* randomize seed for screensaver */
 
     for (;;) {
         tv.tv_sec = 0;
-        tv.tv_usec = speed * 1000;          /* Microseconds */
+        tv.tv_usec = 64 * 1000;          /* Microseconds */
 
         FD_SET(master, &rfd);
         FD_SET(STDIN_FILENO, &rfd);
@@ -281,83 +260,56 @@ int main(int argc, char *argv[]) {
 
                 /* Write data to terminal */
                 if (cc > 0) {
-                    if (!in_show) write(master, buf, cc);
-                else {
+                    if (!in_show || !lock)
+			 write(master, buf, cc);
+                    else {
                         /* Ask for password */
-                        #if (WITH_PAM)
-                            lock = read_password(buf[0],
-                                lock, user, host, pam_service);
-                        #endif
+#if (WITH_PAM)
+			if (pflg) {
+			    if (buf[0] == ' ' && !reblank) {
+		    		if (lock && in_show) {
+					print_buffer(scrbuf);
+					if (!cursor_visible) {
+						SHOW_CURSOR();
+						cursor_visible=1;
+					}
+					reblank=1;
+		    		}
+			    }
+			    else
+                            	lock = read_password(buf[0],
+                                	lock, user, host, pam_service);
+			}
+			else
+				lock = 0;
+#endif
                         if (cflg) cls = 1;
 
                         if (!pflg || !lock) {
                             /* Allow user to proceed */
-                            CLR(); CLS(); SHOW_CURSOR();
+			    if (!cursor_visible) {
+				SHOW_CURSOR();
+				cursor_visible=1;
+			    }
                             if (bflg == RSCR_FMFD)
                                 write(master, &ff, 1);  /* Send Form Feed */
                             else if (bflg == RSCR_CAPS)
                                 NSCR();
-                            else if (bflg == RSCR_BUFF)
+                            else if (bflg == RSCR_BUFF) {
                                 /* from the screen buffer, write out contents
                                 of the current screen + 2*current screen */
-                                if (scrbufp) {
-                                    int k = 0;
-                                    int boffs = sizeof(scrbuf) - sy*sx - 2*sy*sx;
 
-                                    for (k = 0; k < sy*sx + 2*sy*sx; k++) {
-                                        /* Detect ASCII ESC sequences and
-                                        disable "query" attempts to: ... */
-                                        if (scrbuf[boffs + k] == '\033') {
-/*                                            if (scrbuf[boffs + k + 1] == '[' &&
-                                                ((scrbuf[boffs + k + 2] < 48 || scrbuf[boffs + k + 2] > 122) ||
-                                                    (scrbuf[boffs + k + 2] > 58 && scrbuf[boffs + k + 2] < 65))) {
-                                                    k+=4;
-                                                    continue;
-                                            }
-                                            else if (!memcmp(scrbuf + boffs + k, "\033[?25h", 6) &&
-                                                !memcmp(scrbuf + boffs + k, "\033[?25l", 6)) {
-                                                k+=6;
-                                                continue;
-                                            }
-                                            else if (!memcmp(scrbuf + boffs + k, "\033[?47h", 6) &&
-                                                !memcmp(scrbuf + boffs + k, "\033[?47l", 6)) {
-                                                k+=6;
-                                                continue;
-                                            }
-                                            else if (!memcmp(scrbuf + boffs + k, "\033[?1049h", 8) &&
-                                                !memcmp(scrbuf + boffs + k, "\033[?1049l", 8)) {
-                                                k+=8;
-                                                continue;
-                                            }
-                                            else */ if (!memcmp(scrbuf + boffs + k, "\033[6n", 4)) {
-                                                /* ... find cursor position */
-                                                k+=4;
-                                                continue;
-                                            }
-                                            else if (k < sy*sx + 2*sy*sx + 1 && scrbuf[boffs + k + 1] == ']') {
-                                                /* ... fg/bg colors using:
-                                                OSC 10 ; ? BEL and
-                                                OSC 11 ; ? BEL */
-                                                while (scrbuf[boffs + k] != 7)
-                                                    k++;
-                                                continue;
-                                            }
-                                            else if (k < sy*sx + 2*sy*sx + 1 && scrbuf[boffs + k + 1] == 'P') {
-                                                /* Step over DCS, assuming
-                                                it's body 3 bytes long */
-                                                k += 3;
-                                                continue;
-                                            }
-                                        }
-                                        putchar(scrbuf[sizeof(scrbuf) - sy*sx - 2*sy*sx + k]);
-                                    }
-                                }
-                            in_show = 0;
+				if (!reblank)
+					print_buffer(scrbuf);
+			    }
+			    if (!lock) {
+                            	in_show = 0;
 
-                            /* Drop current input buffer when leaving a show */
-                            memset(buf, 0, sizeof(buf));
-                            cc = 0;
-                            lock = 1;       /* lock again */
+                            	/* Drop current input buffer when leaving a show */
+                            	memset(buf, 0, sizeof(buf));
+                            	cc = 0;
+                            	lock = 1;       /* lock again */
+			    }
                         }
                     }
                 }
@@ -366,7 +318,14 @@ int main(int argc, char *argv[]) {
             /* -- OUTPUT ---------------------------------------------------- */
             if (FD_ISSET(master, &rfd)) {
                 if ((cc = read(master, buf, sizeof(buf))) > 0) {
-
+		    if (lock && in_show && !reblank) {
+			print_buffer(scrbuf);
+			if (!cursor_visible) {
+				SHOW_CURSOR();
+				cursor_visible=1;
+			}
+			reblank=1;
+		    }
                     write(STDOUT_FILENO, buf, cc);
                     if (cc && bflg == RSCR_BUFF) {
                         scrbufp = sizeof(scrbuf) - cc;
@@ -386,7 +345,8 @@ int main(int argc, char *argv[]) {
                     CLR(); CLS(); cls = 0;
                 }
 
-            if (!in_show) {
+            if (!in_show || reblank) {
+		reblank=0;
                 if (bflg == RSCR_CAPS) {
                     ASCR();
                     CLR(); CLS();
@@ -394,12 +354,14 @@ int main(int argc, char *argv[]) {
                     cls = cflg ? 1 : 0;
             }
 
-            HIDE_CURSOR();
+	    if (cursor_visible) {
+            	HIDE_CURSOR();
+		cursor_visible=0;
+	    }
 
             in_show = 1;
             lock = 2;               /* Reset lock to first try */
 
-            if (!Bflg) run_show();
         }
     }
 
@@ -408,20 +370,15 @@ int main(int argc, char *argv[]) {
 }
 
 /* -------------------------------------------------------------------------- */
-int run_show() {
-    /* Let's keep the show as simple as possible */
-    SET_POS(rand()%sy, rand()%sx); putchar('.');
-    SET_POS(rand()%sy, rand()%sx); putchar(' ');
-    return 0;
-}
-
-/* -------------------------------------------------------------------------- */
 #if (WITH_PAM)
 int read_password(char ch, int lock, char *user, char *host, char *pam_service) {
     if (lock == 2) {
         /* Clear screen, draw prompt on the first I/O */
-        CLR(); CLS(); SHOW_CURSOR();
-		printf(PWD_PROMPT, user, host);
+	if (!cursor_visible) {
+		SHOW_CURSOR();
+		cursor_visible=1;
+	}
+	printf(PWD_PROMPT, user, host);
         return 1;
     }
 
@@ -432,15 +389,17 @@ int read_password(char ch, int lock, char *user, char *host, char *pam_service) 
     switch(ch) {
         case '\r':
         case '\n':                  /* Check password */
-            CLL();
-		    printf(PWD_PROMPT, user, host);
+            fputs("\n\r", stdout);
             if (!(pam_auth(user, pam_service))) {
                 memset(passwd, 0, sizeof(passwd));
                 pwd_ofs = 0;
                 CLL();
+	    	fputs("terminal unlocked\n\r", stdout);
                 return 0;
             }
-
+	    if (pwd_ofs)
+	    	fputs("password incorrect\n\r", stdout);
+	    printf(PWD_PROMPT, user, host);
             memset(passwd, 0, sizeof(passwd));
             pwd_ofs = 0;
             break;
@@ -525,28 +484,6 @@ void quit(int ecode) {
 }
 
 /* -------------------------------------------------------------------------- */
-void trap(int sig) {
-    struct winsize win;
-
-    /* We hook only window change signal, but let's keep switch/case
-    construction for future */
-    switch(sig) {
-        case SIGWINCH:
-            /* Terminal resized -> resize slave */
-            if (ioctl(STDIN_FILENO, TIOCGWINSZ, &win) != -1) {
-                ioctl(slave, TIOCSWINSZ, &win);
-                GET_POS(cy, cx);
-                SCR_SIZE(sy, sx);
-                SET_POS(cy, cx);
-                CLR();
-            }
-            break;
-        default:
-            break;
-    }
-}
-
-/* -------------------------------------------------------------------------- */
 void wait4child(pid_t pid) {
     int e, status;
 
@@ -563,27 +500,60 @@ void usage(int ecode) {
 
 #if (WITH_PAM)
 	printf("%s\n\nUsage:\n\
-\tsclocka [-b n|b|c] [-c] [-B] [-i n] [-s n] [-p] [-P service] [-h]\n\n\
+\ttvi_screensaver [-b n|b|c] [-c] [-B] [-i n] [-s n] [-p] [-P service] [-h]\n\n\
 [-b %c]\t\tScreen restore: (n)one, (f)ormfeed, (b)uffer, (c)apabilities\n\
 [-c]\t\tDo not clear the window\n\
-[-B]\t\tBlack-only, no screensaver animation\n\
 [-i %d]\t\tWait n minutes before launching the screensaver\n\
-[-s %d]\t\tScreensaver speed n in milliseconds\n\
 \n\
 [-p]\t\tDisable PAM password check\n\
 [-P %s]\tUse custom PAM service\n\
 \n\
-[-h]\t\tThis message\n\n", __PROGRAM, RSCR_DEFT, IVAL, SPEED, PAM_SERV);
+[-h]\t\tThis message\n\n", __PROGRAM, RSCR_DEFT, IVAL, PAM_SERV);
 #else
 	printf("%s\n\nUsage:\n\
-\tsclocka [-b n|b|c] [-c] [-B] [-i n] [-s n] [-P service] [-h]\n\n\
+\tstvi_screensaver [-b n|b|c] [-c] [-B] [-i n] [-s n] [-P service] [-h]\n\n\
 [-b %c]\t\tScreen restore: (n)one, (f)ormfeed, (b)uffer, (c)apabilities\n\
 [-c]\t\tDo not clear the window\n\
-[-B]\t\tBlack-only, no screensaver animation\n\
 [-i %d]\t\tWait n minutes before launching the screensaver\n\
-[-s %d]\t\tScreensaver speed n in milliseconds\n\
 \n\
-[-h]\t\tThis message\n\n", __PROGRAM, RSCR_DEFT, IVAL, SPEED);
+[-h]\t\tThis message\n\n", __PROGRAM, RSCR_DEFT, IVAL);
 #endif
     exit(ecode);
+}
+
+void print_buffer(scrbuf)
+char scrbuf[];
+{
+	int k;
+	char *p;
+	static struct Sl {
+		char *start;
+		char *end;
+		int nl;
+	} sl[2000];
+	int nlc=0, lc=0;
+	
+	for (sl[0].start = scrbuf; sl[0].start < scrbuf + 2000; sl[0].start++)
+		if (*sl[0].start != 0x00)
+			break;
+	for (p = scrbuf; p < scrbuf + 2000; p++) {
+		if (*p == 0x0a) {
+			sl[nlc].end=p;
+			sl[nlc+1].start=p+1;
+			nlc++;
+		}
+	}
+	for (k = 0; k < nlc; k++)
+		sl[k].nl = 1 + (int)(sl[k].end -sl[k].start) / 80;
+	for (k = nlc -1; k >= 0; k--) {
+		if (lc + sl[k].nl < 24)
+			lc += sl[k].nl;
+		else
+			break;
+	}
+	for (k = ++k; k < nlc; k++) {
+		//printf("%d: start 0x%lx end 0x%lx len=%d ln=%d\r\n", k, (unsigned long)(sl[k].start), (unsigned long)(sl[k].end), (int)(sl[k].end -sl[k].start), sl[k].nl);
+		for (p=sl[k].start; p <= sl[k].end; p++)
+			putchar(*p);
+	}
 }
